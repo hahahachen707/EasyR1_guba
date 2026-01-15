@@ -1,0 +1,20 @@
+# Load model directly
+from transformers import AutoTokenizer, AutoModelForCausalLM
+
+PROMPT = "# Role\nYou are an expert futures trading agent. Your task is to make trading decisions for a sequence of 5 days based on market state information.\n\n# Objective\nAnalyze the market state for each day in the trajectory and decide on trading positions. You should consider:\n- Price trends and historical context\n- Technical indicators (normalized returns, volatility, RSI, MACD) for each day\n- Risk management through position sizing\n- Sequential decision-making: each day's decision should consider previous days' market conditions\n\n# Historical Context (for reference)\nRecent Price Trend (last 15 periods before trajectory, up to 15 days): [3560, 3594, 3583, 3613, 3628, 3616, 3608, 3682, 3682, 3675, 3670, 3641, 3681, 3669, 3685]\n\n# Market State Information for 5 Days\n\nDay 1:\n  Time: 2024-04-29\n  Price: 3675.00\n  Volatility (60-day EWMA): 0.0102\n  Normalized Return (1 day): -0.2658\n  Normalized Return (7 days): -0.0704\n  Normalized Return (30 days): 0.8621\n  RSI (30-day): 49.91\n  MACD (16-48): -0.2540\n\nDay 2:\n  Time: 2024-04-30\n  Price: 3656.00\n  Volatility (60-day EWMA): 0.0101\n  Normalized Return (1 day): -0.5127\n  Normalized Return (7 days): -0.1938\n  Normalized Return (30 days): 0.8612\n  RSI (30-day): 48.72\n  MACD (16-48): -0.2319\n\nDay 3:\n  Time: 2024-05-06\n  Price: 3735.00\n  Volatility (60-day EWMA): 0.0107\n  Normalized Return (1 day): 2.0276\n  Normalized Return (7 days): 0.6282\n  Normalized Return (30 days): 1.0826\n  RSI (30-day): 53.50\n  MACD (16-48): -0.1267\n\nDay 4:\n  Time: 2024-05-07\n  Price: 3723.00\n  Volatility (60-day EWMA): 0.0105\n  Normalized Return (1 day): -0.3059\n  Normalized Return (7 days): 0.8105\n  Normalized Return (30 days): 0.7298\n  RSI (30-day): 52.72\n  MACD (16-48): -0.0468\n\nDay 5:\n  Time: 2024-05-08\n  Price: 3674.00\n  Volatility (60-day EWMA): 0.0106\n  Normalized Return (1 day): -1.2398\n  Normalized Return (7 days): -0.0677\n  Normalized Return (30 days): 0.5010\n  RSI (30-day): 49.70\n  MACD (16-48): -0.0322\n\n# Output Format\nYou must strictly output a valid JSON object following the structure below:\n{\n  \"positions\": [action_0, action_1, ..., action_4],\n  \"reasoning\": \"Brief explanation of your trading strategy for this trajectory\"\n}\n\nPosition values (continuous in range [-1, 1] for each day):\n- -1.0: Fully short position (maximum bearish, expect price to fall)\n- 0.0: No position (neutral, hold cash)\n- 1.0: Fully long position (maximum bullish, expect price to rise)\n- Values between -1 and 1 represent partial positions (e.g., 0.5 means 50% long position)\n\nImportant:\n- The \"positions\" array must contain exactly 5 values, one for each day\n- Each position value corresponds to the trading decision for that day\n- positions[0] corresponds to Day 1, positions[1] to Day 2, and so on\n- Consider the sequential nature: decisions should account for market evolution across days\n\nReasoning: Brief explanation of your overall trading strategy for this 5-day trajectory\n\n# Formatting Constraints\n1. Output **only** the raw JSON string.\n2. Do **not** use markdown code blocks (e.g., ```json ... ```).\n3. Ensure the JSON is syntactically valid (proper escaping of quotes, no trailing commas).\n4. The \"positions\" array must have exactly 5 elements.\n"
+
+tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-4B-Instruct-2507")
+model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen3-4B-Instruct-2507")
+messages = [
+    {"role": "user", "content": PROMPT},
+]
+inputs = tokenizer.apply_chat_template(
+	messages,
+	add_generation_prompt=True,
+	tokenize=True,
+	return_dict=True,
+	return_tensors="pt",
+).to(model.device)
+
+outputs = model.generate(**inputs, max_new_tokens=40)
+print(tokenizer.decode(outputs[0][inputs["input_ids"].shape[-1]:]))
