@@ -117,7 +117,11 @@ def income_reward(response: str, ground_truth: str) -> float:
             volatility_target = gt_data.get("volatility_target", 0.15)
             transaction_cost_bp = gt_data.get("transaction_cost_bp", 0.002)
             mu = gt_data.get("mu", 1.0)
+            mse_weight = gt_data.get("mse_weight", 0.5) # MSE Loss 权重
             
+            # 专家动作序列 (用于 MSE Loss)
+            expert_positions = gt_data.get("expert_positions", [])
+
             # 初始状态
             # action_t_prev: 上一步的持仓，用于计算第一步的调仓成本
             action_t_prev = gt_data.get("initial_action", random.uniform(-1, 1)) 
@@ -133,6 +137,8 @@ def income_reward(response: str, ground_truth: str) -> float:
             # 所以 prices 长度至少需要 len(positions) + 1
             steps = len(positions)
             
+            mse_loss = 0.0
+            
             for i in range(steps):
                 # 获取当前决策并规范化
                 raw_pos = positions[i]
@@ -140,6 +146,11 @@ def income_reward(response: str, ground_truth: str) -> float:
                     current_action = max(-1.0, min(1.0, float(raw_pos)))
                 else:
                     current_action = 0.0
+                
+                # 计算 MSE Loss (如果提供了专家动作)
+                if expert_positions and i < len(expert_positions):
+                    expert_action = expert_positions[i]
+                    mse_loss += (current_action - expert_action) ** 2
 
                 # 获取环境数据
                 price_t = prices[i+1]      # p_{t} 
@@ -149,105 +160,43 @@ def income_reward(response: str, ground_truth: str) -> float:
                 # 计算波动率缩放因子
                 scale_t_prev = volatility_target / (vol_t_prev + 1e-8)
                 
-                # 1. 计算收益: Profit = A_{t-1} * scale * r_t
-                r_t = price_t - price_t_prev
+                # 1. 计算收益 (使用收益率而非绝对价格，实现无量纲化，与 MSE 量级匹配)
+                # r_t = (p_t - p_{t-1}) / p_{t-1}
+                r_t = (price_t - price_t_prev) / (price_t_prev + 1e-8)
                 profit = current_action * scale_t_prev * r_t
                 
-                # 2. 计算交易成本: Cost = bp * p_{t-1} * |change|
-                # change = | scale_t * A_t - scale_{t-1} * A_{t-1} |
+                # 2. 计算交易成本 (同样标准化为收益率形式)
+                # Cost = bp * |change| (不再乘以价格)
+                # change = | scale_t * A_t - scale_{t-1} * A_{t-1} |2.5*16
                 position_change = abs(scale_t_prev * current_action - scale_t_prev_prev * action_t_prev)
-                transaction_cost = transaction_cost_bp * price_t_prev * position_change
+                transaction_cost = transaction_cost_bp * position_change
                 
                 # 累计单步奖励
                 step_reward = mu * (profit - transaction_cost)
-                total_reward += 0.99 * step_reward
+                total_reward += step_reward
                 
                 # 更新状态用于下一步
                 action_t_prev = current_action
                 scale_t_prev_prev = scale_t_prev
 
+            # 计算平均 MSE
+            if steps > 0:
+                mse_loss = mse_loss / steps
+            
+            # 减去 MSE Loss 惩罚
+            # total_reward -= mse_weight * mse_loss
+
             # 轨迹奖励归一化
             # GRPO 后续会进行组内归一化 (r - mean) / std，因此这里不需要做非线性变换 (tanh)
             # 直接返回原始的累计奖励，保持收益的线性差异，以便模型能够区分“好”与“更好”
-            return float(total_reward)
+            return float(total_reward), float(mse_loss)
         else:
-            return -100.0
+            return -10.0, 0.0
 
-        # # ==========================================
-        # # 模式 2: 单步模式 (Single Step Mode)
-        # # ==========================================
-        # position = response_data.get("position")
-        
-        # # 确保 position 在有效范围内
-        # if position is None:
-        #     return 0.0
-        # # 将 position 规范化为 [-1, 1] 范围
-        # if isinstance(position, (int, float)):
-        #     position = max(-1.0, min(1.0, float(position)))
-        # else:
-        #     return 0.0
-
-        # # 解析 ground_truth
-        
-        # # 尝试从历史缓冲区获取实际的历史动作
-        # sequence_id = gt_data.get("sequence_id", "default")
-        # time_index = gt_data.get("time_index", None)
-        
-        # # 如果提供了时间索引，尝试使用动态历史动作
-        # if time_index is not None:
-        #     # 使用动态历史动作
-        #     if sequence_id not in _action_history_buffer:
-        #         _action_history_buffer[sequence_id] = {}
-            
-        #     history = _action_history_buffer[sequence_id]
-            
-        #     # 从历史中获取之前的动作（如果存在），否则使用 ground_truth 中的参考值
-        #     action_t_prev = history.get(time_index - 1, gt_data.get("action_t_prev", 0.0))
-        #     action_t_prev_prev = history.get(time_index - 2, gt_data.get("action_t_prev_prev", 0.0))
-            
-        #     # 更新历史缓冲区
-        #     history[time_index] = position
-        # else:
-        #     # 如果没有时间索引，使用 ground_truth 中预设的历史动作
-        #     action_t_prev = gt_data.get("action_t_prev", 0.0)
-        #     action_t_prev_prev = gt_data.get("action_t_prev_prev", 0.0)
-
-        # price_t = gt_data.get("price_t", 0.0)
-        # price_t_prev = gt_data.get("price_t_prev", 0.0)
-        # volatility_t_prev = gt_data.get("volatility_t_prev", 1.0)
-        # volatility_t_prev_prev = gt_data.get("volatility_t_prev_prev", 1.0)
-        # volatility_target = gt_data.get("volatility_target", 0.15)
-        # transaction_cost_bp = gt_data.get("transaction_cost_bp", 2.0)
-        # mu = gt_data.get("mu", 1.0)
-
-        # # 验证数据有效性
-        # if price_t <= 0 or price_t_prev <= 0 or volatility_t_prev <= 0:
-        #     return 0.0
-
-        # # 计算收益率 r_t = p_t - p_{t-1}
-        # r_t = price_t - price_t_prev
-
-        # # 计算波动率缩放因子
-        # scale_t_prev = volatility_target / (volatility_t_prev + 1e-8)
-        # scale_t_prev_prev = volatility_target / (volatility_t_prev_prev + 1e-8) if volatility_t_prev_prev > 0 else scale_t_prev
-
-        # # 计算收益部分
-        # profit = action_t_prev * scale_t_prev * r_t
-
-        # # 计算交易成本部分
-        # position_change = abs(scale_t_prev * action_t_prev - scale_t_prev_prev * action_t_prev_prev)
-        # transaction_cost = transaction_cost_bp * 0.0001 * price_t_prev * position_change
-
-        # # 计算奖励
-        # reward = mu * (profit - transaction_cost)
-
-        # # 将奖励归一化到 [0, 1] 范围
-        # normalized_reward = (np.tanh(reward * 100) + 1) / 2
-
-        # return float(normalized_reward)
+       
 
     except (json.JSONDecodeError, AttributeError, ValueError, TypeError, KeyError) as e:
-        return 0.0
+        return -10, 0.0
 
 
 def compute_score(reward_inputs: list[dict[str, Any]], format_weight: float = 0.1) -> list[dict[str, float]]:
@@ -258,21 +207,22 @@ def compute_score(reward_inputs: list[dict[str, Any]], format_weight: float = 0.
     scores = []
     for reward_input in reward_inputs:
         format_score = format_reward(reward_input["response"])
-        income_score = income_reward(reward_input["response"], reward_input["ground_truth"])
+        income_score, mse_loss = income_reward(reward_input["response"], reward_input["ground_truth"])
         
         # 格式错误惩罚：如果格式错误（format_score=0），强制 overall 为一个较大的负值
         # 避免模型因为 income 为负（亏损）而故意输出错误格式来获得 0 分
         if format_score == 0.0:
-            overall_score = -100.0  # 或者更小的负值，例如 -10.0，取决于 income 的量级
+            overall_score = -10.0  # 或者更小的负值，例如 -10.0，取决于 income 的量级
         else:
             # 格式正确时，综合分数：格式权重 * 格式分数 + (1 - 格式权重) * 准确度分数
-            overall_score = format_weight * format_score + (1 - format_weight) * income_score
+            overall_score = format_weight * format_score + (1 - format_weight) * income_score - 0.5 * mse_loss
         
         scores.append(
             {
                 "overall": overall_score,
                 "format": format_score,
                 "income": income_score,
+                "mse_loss": mse_loss,
             }
         )
 

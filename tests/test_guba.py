@@ -1,7 +1,7 @@
 """
 测试训练好的期货交易模型在测试集上的表现，计算实际收益
 根据 EasyR1/examples/reward_function/reward_guba.py 和 guba/gen_data.py 的逻辑进行重写。
-使用滑动窗口为1的测试数据进行回测，每次只取模型预测轨迹的第一个动作。
+使用滑动窗口为1的测试数据进行回测，使用模型预测轨迹的所有动作（positions列表的所有值）。
 改为串行推理，以确保正确的状态依赖（交易成本计算依赖于上一步的实际模型输出）。
 """
 
@@ -33,10 +33,11 @@ def load_test_data(test_file: str) -> List[Dict]:
     return samples
 
 
-def parse_model_response(response: str) -> float:
+def parse_model_response(response: str) -> List[float]:
     """
-    解析模型输出，提取 positions 列表的第一个值作为当前动作。
+    解析模型输出，提取 positions 列表的所有值作为动作序列。
     期望格式: {"positions": [0.5, 0.2, ...], "reasoning": "..."}
+    返回: positions 列表，每个值都被限制在 [-1.0, 1.0] 范围内
     """
     try:
         # 尝试提取 JSON 内容
@@ -44,27 +45,31 @@ def parse_model_response(response: str) -> float:
         end_idx = response.rfind("}")
         
         if start_idx == -1 or end_idx == -1 or start_idx >= end_idx:
-            return 0.0
+            return [0.0]
         
         json_str = response[start_idx : end_idx + 1]
         data = json.loads(json_str)
         
-        # 提取 positions
+        # 提取 positions（所有值）
         if "positions" in data and isinstance(data["positions"], list) and len(data["positions"]) > 0:
             print(data["positions"])
-            first_action = data["positions"][0]
-            if isinstance(first_action, (int, float)):
-                return max(-1.0, min(1.0, float(first_action)))
+            actions = []
+            for action in data["positions"]:
+                if isinstance(action, (int, float)):
+                    actions.append(max(-1.0, min(1.0, float(action))))
+                else:
+                    actions.append(0.0)
+            return actions if actions else [0.0]
         
         # 兼容旧格式或单步格式
         if "position" in data:
              pos = data["position"]
              if isinstance(pos, (int, float)):
-                 return max(-1.0, min(1.0, float(pos)))
+                 return [max(-1.0, min(1.0, float(pos)))]
 
-        return 0.0
+        return [0.0]
     except (json.JSONDecodeError, AttributeError, ValueError, TypeError, KeyError):
-        return 0.0
+        return [0.0]
 
 
 def evaluate_model(
@@ -79,8 +84,8 @@ def evaluate_model(
     
     
     
-    processor = AutoProcessor.from_pretrained("Qwen/Qwen3-VL-4B-Instruct", device_map="cuda")
-    model = AutoModelForImageTextToText.from_pretrained("Qwen/Qwen3-VL-4B-Instruct", device_map="cuda")    
+    processor = AutoProcessor.from_pretrained(model_path, device_map="cuda")
+    model = AutoModelForImageTextToText.from_pretrained(model_path, device_map="cuda")    
 
 
    
@@ -127,7 +132,7 @@ def evaluate_model(
     # import ipdb; ipdb.set_trace()
     for seq_id, group in groupby(parsed_samples, key=lambda x: x["sequence_id"]):
         items = list(group)
-        import ipdb; ipdb.set_trace()
+        # import ipdb; ipdb.set_trace()
         
         # 初始化序列状态
         first_gt = items[0]["gt"]
@@ -137,7 +142,10 @@ def evaluate_model(
         
         last_idx = items[0]["start_idx"] - 1
         
-        for item in items:
+        # 使用索引遍历，以便在需要时跳过样本
+        item_idx = 0
+        while item_idx < len(items):
+            item = items[item_idx]
             current_idx = item["start_idx"]
             
             # 连续性检查
@@ -164,55 +172,91 @@ def evaluate_model(
             response = processor.decode(outputs[0][inputs["input_ids"].shape[-1]:])
             print(response)
 
-            # 2. 解析动作 A_t
-            action_t = parse_model_response(response)
+            # 2. 解析所有动作
+            actions = parse_model_response(response)
             
-            if action_t != 0.0 or "positions" in response:
+            if any(a != 0.0 for a in actions) or "positions" in response:
                 valid_responses += 1
-            positions.append(action_t)
             
-            # 3. 计算奖励 (单步)
-            gt_prices = item["gt"].get("prices", [])
-            gt_vols = item["gt"].get("volatilities", [])
+            # 3. 对每个动作计算奖励
+            # 每个动作应该使用对应位置的数据样本
+            num_actions = len(actions)
             
+            # 确定实际可使用的动作数量（受限于剩余的 items 数量）
+            max_steps = min(num_actions, len(items) - item_idx)
             
+            if max_steps == 0:
+                # 如果没有可用动作或没有剩余样本，至少处理第一个
+                max_steps = 1
+            
+            # 遍历所有动作并计算奖励
+            for step_idx in range(max_steps):
+                if item_idx + step_idx >= len(items):
+                    break
+                    
+                action_t = actions[step_idx]
+                positions.append(action_t)
                 
+                # 获取对应位置的数据样本
+                current_item = items[item_idx + step_idx]
+                gt_prices = current_item["gt"].get("prices", [])
+                gt_vols = current_item["gt"].get("volatilities", [])
                 
+                # 获取当前价格
+                if len(gt_prices) > 0:
+                    price_t = gt_prices[0]
+                else:
+                    price_t = 0.0
                 
+                # 获取下一个价格（优先使用当前 item 的 prices[1]，否则使用下一个 item 的 prices[0]）
+                if len(gt_prices) > 1:
+                    price_next = gt_prices[1]
+                elif item_idx + step_idx + 1 < len(items):
+                    next_item = items[item_idx + step_idx + 1]
+                    next_prices = next_item["gt"].get("prices", [])
+                    price_next = next_prices[0] if len(next_prices) > 0 else price_t
+                else:
+                    price_next = price_t
                 
-            price_t = gt_prices[0]
-            price_next = gt_prices[1]
-            vol_t = gt_vols[0]
+                # 获取波动率
+                vol_t = gt_vols[0] if len(gt_vols) > 0 else 0.15
+                
+                scale_t = volatility_target / (vol_t + 1e-8)
+                
+                # 收益 (Profit)
+                r_t_next = price_next - price_t
+                profit = action_t * scale_t * r_t_next
+                
+                # 交易成本 (Cost)
+                position_change = abs(scale_t * action_t - prev_scale * prev_action)
+                cost = transaction_cost_bp * price_t * position_change
+                
+                step_reward = mu * (profit - cost)
+                
+                rewards.append(step_reward)
+                total_reward += step_reward
+                cumulative_wealth += step_reward
+                
+                # 打印中间结果
+                tqdm.write(f"Step {processed_count}[{step_idx}/{max_steps-1}]: ItemIdx={item_idx+step_idx}, Action={action_t:.4f}, PrevAction={prev_action:.4f}, PriceChange={r_t_next:.2f}, Profit={profit:.2f}, Cost={cost:.2f}, Reward={step_reward:.2f}")
+                
+                # 更新状态
+                prev_action = action_t
+                prev_scale = scale_t
+                processed_count += 1
+                
+                pbar.set_postfix({"Wealth": f"{cumulative_wealth:.0f}", "LastReward": f"{step_reward:.2f}"})
             
-            scale_t = volatility_target / (vol_t + 1e-8)
+            # 检查可能的解析错误
+            if max_steps == 0 or all(a == 0.0 for a in actions):
+                if "positions" not in response and "position" not in response:
+                    tqdm.write(f"  [Warning] Possible Parse Error. Response: {response[:100]}...")
             
-            # 收益 (Profit)
-            r_t_next = price_next - price_t
-            profit = action_t * scale_t * r_t_next
-            
-            # 交易成本 (Cost)
-            position_change = abs(scale_t * action_t - prev_scale * prev_action)
-            cost = transaction_cost_bp * price_t * position_change
-            
-            step_reward = mu * (profit - cost)
-            
-            rewards.append(step_reward)
-            total_reward += step_reward
-            cumulative_wealth += step_reward
-            
-            # 打印中间结果
-            tqdm.write(f"Step {processed_count}: Action={action_t:.4f}, PrevAction={prev_action:.4f}, PriceChange={r_t_next:.2f}, Profit={profit:.2f}, Cost={cost:.2f}, Reward={step_reward:.2f}")
-            if step_reward == 0.0 and action_t == 0.0:
-                 if "positions" not in response and "position" not in response:
-                      tqdm.write(f"  [Warning] Possible Parse Error. Response: {response[:100]}...")
-
-            # 更新状态
-            prev_action = action_t
-            prev_scale = scale_t
-            processed_count += 1
-            
-            pbar.update(1)
-            pbar.set_postfix({"Wealth": f"{cumulative_wealth:.0f}", "LastReward": f"{step_reward:.2f}"})
+            # 关键：跳过已使用的样本
+            # 如果使用了 N 个动作，需要跳过 N 个样本（当前样本 + 接下来的 N-1 个）
+            # 但实际跳过的步数取决于实际使用的动作数量
+            item_idx += max_steps
+            pbar.update(max_steps)
     
     pbar.close()
     
@@ -271,10 +315,10 @@ def evaluate_model(
 
 if __name__ == "__main__":
     # 配置
-    base_path = Path("/home/tione/notebook/workspace/xiaoyangchen/work/EasyR1/checkpoints/easy_r1")
   
-    model_path = "Qwen/Qwen3-VL-4B-Instruct"  # 可以改为本地 checkpoint 路径或纯文本模型名称
-    
+    # model_path = "Qwen/Qwen3-VL-4B-Instruct"  # 可以改为本地 checkpoint 路径或纯文本模型名称
+    model_path = "/home/tione/notebook/workspace/xiaoyangchen/work/EasyR1/checkpoints/easy_r1/qwen3_4b_instruct_guba_grpo_mse/global_step_125/actor/huggingface"  # 可以改为本地 checkpoint 路径或纯文本模型名称
+    # model_path = "/home/tione/notebook/workspace/xiaoyangchen/work/LLaMA-Factory/output/qwen3vl_guba_lora_sft"
    
     
     test_file = "/home/tione/notebook/workspace/xiaoyangchen/work/data/guba/guba_eval_verl.jsonl"
@@ -292,7 +336,7 @@ if __name__ == "__main__":
     )
     
     # 保存结果
-    output_file = Path(model_path).parent / "evaluation_results_sequential.json" if model_path else Path("evaluation_results_sequential.json")
+    output_file = Path(model_path).parent / "evaluation_results_sequential_rl_mse_eval.json" if model_path else Path("evaluation_results_sequential.json")
     with open(output_file, 'w', encoding='utf-8') as f:
         # 转换 numpy 类型为 python 类型以便 json 序列化
         def convert(o):
