@@ -13,6 +13,7 @@ from typing import Dict, List, Tuple, Any, Optional
 from itertools import groupby
 
 import numpy as np
+import pandas as pd
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers import AutoProcessor, AutoModelForImageTextToText
@@ -20,6 +21,9 @@ from tqdm import tqdm
 
 # 添加项目根目录到路径
 sys.path.insert(0, str(Path(__file__).parent.parent))
+# 添加当前目录到路径以导入 metrics
+sys.path.append(str(Path(__file__).parent))
+from metrics import TradingMetrics
 
 
 def load_test_data(test_file: str) -> List[Dict]:
@@ -264,6 +268,10 @@ def evaluate_model(
     rewards_np = np.array(rewards)
     positions_np = np.array(positions)
     
+    # 使用 TradingMetrics 计算指标
+    metrics_calculator = TradingMetrics(rewards_np, annualization=252)
+    metrics_summary = metrics_calculator.get_metrics_summary()
+
     stats = {
         "initial_wealth": initial_wealth,
         "final_wealth": cumulative_wealth,
@@ -273,24 +281,16 @@ def evaluate_model(
         "processed_samples": processed_count,
         "mean_reward": np.mean(rewards_np) if len(rewards_np) > 0 else 0.0,
         "std_reward": np.std(rewards_np) if len(rewards_np) > 0 else 0.0,
-        "max_drawdown": 0.0,
-        "sharpe_ratio": 0.0,
+        "max_drawdown": metrics_summary["MDD"],  # 使用 metrics.py 的计算结果
+        "sharpe_ratio": metrics_summary["Sharpe"], # 使用 metrics.py 的计算结果
         "avg_position": np.mean(np.abs(positions_np)) if len(positions_np) > 0 else 0.0,
         "long_count": int(np.sum(positions_np > 0.01)),
         "short_count": int(np.sum(positions_np < -0.01)),
         "neutral_count": int(np.sum(np.abs(positions_np) <= 0.01))
     }
     
-    # 计算最大回撤
-    if len(rewards) > 0:
-        cum_returns = np.cumsum(rewards)
-        running_max = np.maximum.accumulate(cum_returns)
-        drawdown = running_max - cum_returns
-        stats["max_drawdown"] = np.max(drawdown)
-    
-    # 计算夏普比率
-    if len(rewards) > 1 and np.std(rewards) > 1e-6:
-        stats["sharpe_ratio"] = (np.mean(rewards) / np.std(rewards)) * np.sqrt(252)
+    # 合并 metrics.py 的其他指标
+    stats.update(metrics_summary)
         
     # 打印结果
     print("\n" + "="*60)
@@ -300,9 +300,19 @@ def evaluate_model(
     print(f"最终财富: {stats['final_wealth']:.2f}")
     print(f"累计收益: {stats['total_reward']:.2f}")
     print(f"收益率: {stats['return_rate']:.2f}%")
-    print(f"夏普比率: {stats['sharpe_ratio']:.4f}")
-    print(f"最大回撤: {stats['max_drawdown']:.2f}")
     print(f"平均每步收益: {stats['mean_reward']:.2f}")
+    print("-" * 30)
+    print("核心指标 (Metrics):")
+    print(f"Sharpe (夏普比率): {stats['Sharpe']:.4f}")
+    print(f"Sortino (索提诺比率): {stats['Sortino']:.4f}")
+    print(f"Calmar (卡尔玛比率): {stats['Calmar']:.4f}")
+    print(f"MDD (最大回撤): {stats['MDD']:.4f}")
+    print(f"Win Rate (胜率): {stats['% +ve Returns']*100:.2f}%")
+    print(f"P/L Ratio (盈亏比): {stats['Ave. P / Ave. L']:.4f}")
+    print("-" * 30)
+    print(f"E(R) (年化期望回报): {stats['E(R)']:.4f}")
+    print(f"Std(R) (年化标准差): {stats['Std(R)']:.4f}")
+    print(f"DD (下行偏差): {stats['DD']:.4f}")
     print("-" * 30)
     print(f"总样本数: {stats['processed_samples']}")
     print(f"有效响应率: {stats['valid_response_rate']*100:.1f}%")
@@ -316,8 +326,8 @@ def evaluate_model(
 if __name__ == "__main__":
     # 配置
   
-    # model_path = "Qwen/Qwen3-VL-4B-Instruct"  # 可以改为本地 checkpoint 路径或纯文本模型名称
-    model_path = "/home/tione/notebook/workspace/xiaoyangchen/work/EasyR1/checkpoints/easy_r1/qwen3_4b_instruct_guba_grpo_mse/global_step_125/actor/huggingface"  # 可以改为本地 checkpoint 路径或纯文本模型名称
+    model_path = "Qwen/Qwen3-VL-4B-Instruct"  # 可以改为本地 checkpoint 路径或纯文本模型名称
+    # model_path = "/home/tione/notebook/workspace/xiaoyangchen/work/EasyR1/checkpoints/easy_r1/qwen3_4b_instruct_guba_grpo_mse/global_step_125/actor/huggingface"  # 可以改为本地 checkpoint 路径或纯文本模型名称
     # model_path = "/home/tione/notebook/workspace/xiaoyangchen/work/LLaMA-Factory/output/qwen3vl_guba_lora_sft"
    
     
